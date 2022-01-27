@@ -78,6 +78,7 @@ type HelmReleaseReconciler struct {
 	EventRecorder         kuberecorder.EventRecorder
 	ExternalEventRecorder *events.Recorder
 	MetricsRecorder       *metrics.Recorder
+	DefaultServiceAccount string
 }
 
 func (r *HelmReleaseReconciler) SetupWithManager(mgr ctrl.Manager, opts HelmReleaseReconcilerOptions) error {
@@ -446,43 +447,51 @@ func (r *HelmReleaseReconciler) checkDependencies(hr v2.HelmRelease) error {
 	return nil
 }
 
+func (r *HelmReleaseReconciler) setImpersonationConfig(restConfig *rest.Config, hr v2.HelmRelease) {
+	name := r.DefaultServiceAccount
+	if sa := hr.Spec.ServiceAccountName; sa != "" {
+		name = sa
+	}
+	if name != "" {
+		username := fmt.Sprintf("system:serviceaccount:%s:%s", hr.GetNamespace(), name)
+		restConfig.Impersonate = rest.ImpersonationConfig{UserName: username}
+	}
+}
+
 func (r *HelmReleaseReconciler) getRESTClientGetter(ctx context.Context, hr v2.HelmRelease) (genericclioptions.RESTClientGetter, error) {
-	if hr.Spec.KubeConfig == nil {
-		// impersonate service account if specified
-		if hr.Spec.ServiceAccountName != "" {
-			token, err := r.getServiceAccountToken(ctx, hr)
-			if err != nil {
-				return nil, fmt.Errorf("could not impersonate ServiceAccount '%s': %w", hr.Spec.ServiceAccountName, err)
+	config := *r.Config
+	r.setImpersonationConfig(&config, hr)
+
+	if hr.Spec.KubeConfig != nil {
+		secretName := types.NamespacedName{
+			Namespace: hr.GetNamespace(),
+			Name:      hr.Spec.KubeConfig.SecretRef.Name,
+		}
+		var secret corev1.Secret
+		if err := r.Get(ctx, secretName, &secret); err != nil {
+			return nil, fmt.Errorf("could not find KubeConfig secret '%s': %w", secretName, err)
+		}
+
+		var kubeConfig []byte
+		for k, _ := range secret.Data {
+			if k == "value" || k == "value.yaml" {
+				kubeConfig = secret.Data[k]
+				break
 			}
-
-			config := *r.Config
-			config.BearerToken = token
-			return kube.NewInClusterRESTClientGetter(&config, hr.GetReleaseNamespace()), nil
 		}
 
-		return kube.NewInClusterRESTClientGetter(r.Config, hr.GetReleaseNamespace()), nil
-	}
-	secretName := types.NamespacedName{
-		Namespace: hr.GetNamespace(),
-		Name:      hr.Spec.KubeConfig.SecretRef.Name,
-	}
-	var secret corev1.Secret
-	if err := r.Get(ctx, secretName, &secret); err != nil {
-		return nil, fmt.Errorf("could not find KubeConfig secret '%s': %w", secretName, err)
-	}
-
-	var kubeConfig []byte
-	for k, _ := range secret.Data {
-		if k == "value" || k == "value.yaml" {
-			kubeConfig = secret.Data[k]
-			break
+		if len(kubeConfig) == 0 {
+			return nil, fmt.Errorf("KubeConfig secret '%s' does not contain a 'value' key", secretName)
 		}
+		return kube.NewMemoryRESTClientGetter(kubeConfig, hr.GetReleaseNamespace(), &config), nil
 	}
 
-	if len(kubeConfig) == 0 {
-		return nil, fmt.Errorf("KubeConfig secret '%s' does not contain a 'value' key", secretName)
+	if r.DefaultServiceAccount != "" || hr.Spec.ServiceAccountName != "" {
+		return kube.NewInClusterRESTClientGetter(&config, hr.GetReleaseNamespace()), nil
 	}
-	return kube.NewMemoryRESTClientGetter(kubeConfig, hr.GetReleaseNamespace()), nil
+
+	return kube.NewInClusterRESTClientGetter(r.Config, hr.GetReleaseNamespace()), nil
+
 }
 
 func (r *HelmReleaseReconciler) getServiceAccountToken(ctx context.Context, hr v2.HelmRelease) (string, error) {

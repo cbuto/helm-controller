@@ -32,6 +32,10 @@ func NewInClusterRESTClientGetter(cfg *rest.Config, namespace string) genericcli
 	flags.BearerToken = &cfg.BearerToken
 	flags.CAFile = &cfg.CAFile
 	flags.Namespace = &namespace
+	if sa := cfg.Impersonate.UserName; sa != "" {
+		flags.Impersonate = &sa
+	}
+
 	return flags
 }
 
@@ -40,23 +44,36 @@ func NewInClusterRESTClientGetter(cfg *rest.Config, namespace string) genericcli
 type MemoryRESTClientGetter struct {
 	kubeConfig []byte
 	namespace  string
+	cfg        *rest.Config
 }
 
-func NewMemoryRESTClientGetter(kubeConfig []byte, namespace string) genericclioptions.RESTClientGetter {
+func NewMemoryRESTClientGetter(kubeConfig []byte, namespace string, cfg *rest.Config) genericclioptions.RESTClientGetter {
 	return &MemoryRESTClientGetter{
 		kubeConfig: kubeConfig,
 		namespace:  namespace,
+		cfg:        cfg,
 	}
 }
 
 func (c *MemoryRESTClientGetter) ToRESTConfig() (*rest.Config, error) {
-	return clientcmd.RESTConfigFromKubeConfig(c.kubeConfig)
+	cfg, err := clientcmd.RESTConfigFromKubeConfig(c.kubeConfig)
+	if err != nil {
+		return nil, err
+	}
+	if sa := c.cfg.Impersonate.UserName; sa != "" {
+		cfg.Impersonate = c.cfg.Impersonate
+	}
+	return cfg, nil
 }
 
 func (c *MemoryRESTClientGetter) ToDiscoveryClient() (discovery.CachedDiscoveryInterface, error) {
 	config, err := c.ToRESTConfig()
 	if err != nil {
 		return nil, err
+	}
+
+	if sa := c.cfg.Impersonate.UserName; sa != "" {
+		config.Impersonate = c.cfg.Impersonate
 	}
 
 	// The more groups you have, the more discovery requests you need to make.
@@ -87,6 +104,10 @@ func (c *MemoryRESTClientGetter) ToRawKubeConfigLoader() clientcmd.ClientConfig 
 
 	overrides := &clientcmd.ConfigOverrides{ClusterDefaults: clientcmd.ClusterDefaults}
 	overrides.Context.Namespace = c.namespace
+
+	if sa := c.cfg.Impersonate.UserName; sa != "" {
+		overrides.AuthInfo.Impersonate = c.cfg.Impersonate.UserName
+	}
 
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, overrides)
 }
